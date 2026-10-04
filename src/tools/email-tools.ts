@@ -31,25 +31,33 @@ export function emailTools(
       folder: z.string().default('INBOX').describe('Folder name (default: INBOX)'),
       from: z.string().optional().describe('Search by sender'),
       to: z.string().optional().describe('Search by recipient'),
+      cc: z.string().optional().describe('Search by CC recipient'),
+      bcc: z.string().optional().describe('Search by BCC recipient'),
       subject: z.string().optional().describe('Search by subject'),
       body: z.string().optional().describe('Search in body text'),
       since: z.string().optional().describe('Search emails since date (YYYY-MM-DD)'),
       before: z.string().optional().describe('Search emails before date (YYYY-MM-DD)'),
       seen: z.boolean().optional().describe('Filter by read/unread status'),
       flagged: z.boolean().optional().describe('Filter by flagged status'),
+      larger: z.coerce.number().optional().describe('Find emails larger than N bytes'),
+      smaller: z.coerce.number().optional().describe('Find emails smaller than N bytes'),
       limit: z.coerce.number().optional().default(50).describe('Maximum number of results'),
     }
   }, async ({ accountId, folder, limit, ...searchCriteria }) => {
     const criteria: any = {};
-    
+
     if (searchCriteria.from) criteria.from = searchCriteria.from;
     if (searchCriteria.to) criteria.to = searchCriteria.to;
+    if (searchCriteria.cc) criteria.cc = searchCriteria.cc;
+    if (searchCriteria.bcc) criteria.bcc = searchCriteria.bcc;
     if (searchCriteria.subject) criteria.subject = searchCriteria.subject;
     if (searchCriteria.body) criteria.body = searchCriteria.body;
     if (searchCriteria.since) criteria.since = parseDateOnly(searchCriteria.since);
     if (searchCriteria.before) criteria.before = parseDateOnly(searchCriteria.before);
     if (searchCriteria.seen !== undefined) criteria.seen = searchCriteria.seen;
     if (searchCriteria.flagged !== undefined) criteria.flagged = searchCriteria.flagged;
+    if (searchCriteria.larger !== undefined) criteria.larger = searchCriteria.larger;
+    if (searchCriteria.smaller !== undefined) criteria.smaller = searchCriteria.smaller;
     
     const messages = await imapService.searchEmails(accountId, folder, criteria);
     const limitedMessages = messages.slice(0, limit);
@@ -236,6 +244,97 @@ export function emailTools(
         text: JSON.stringify({
           success: true,
           message: `Email ${uid} marked as unread`,
+        }, null, 2)
+      }]
+    };
+  });
+
+  // Flag email tool
+  server.registerTool('imap_flag_email', {
+    description: 'Flag an email (sets \\Flagged — shows as ⭐ in Apple Mail)',
+    inputSchema: {
+      accountId: z.string().describe('Account ID'),
+      folder: z.string().default('INBOX').describe('Folder name'),
+      uid: z.coerce.number().describe('Email UID'),
+    }
+  }, async ({ accountId, folder, uid }) => {
+    await imapService.markAsFlagged(accountId, folder, uid);
+
+    return {
+      content: [{
+        type: 'text',
+        text: JSON.stringify({
+          success: true,
+          message: `Email ${uid} flagged (⭐)`,
+        }, null, 2)
+      }]
+    };
+  });
+
+  // Unflag email tool
+  server.registerTool('imap_unflag_email', {
+    description: 'Remove flag from an email (removes \\Flagged / ⭐ in Apple Mail)',
+    inputSchema: {
+      accountId: z.string().describe('Account ID'),
+      folder: z.string().default('INBOX').describe('Folder name'),
+      uid: z.coerce.number().describe('Email UID'),
+    }
+  }, async ({ accountId, folder, uid }) => {
+    await imapService.markAsUnflagged(accountId, folder, uid);
+
+    return {
+      content: [{
+        type: 'text',
+        text: JSON.stringify({
+          success: true,
+          message: `Email ${uid} unflagged`,
+        }, null, 2)
+      }]
+    };
+  });
+
+  // Save draft tool
+  server.registerTool('imap_save_draft', {
+    description: 'Save an email as draft in the Drafts folder (visible immediately in Apple Mail)',
+    inputSchema: {
+      accountId: z.string().describe('Account ID'),
+      from: z.string().describe('Sender email address'),
+      to: z.union([z.string(), z.array(z.string())]).describe('Recipient(s)'),
+      subject: z.string().describe('Email subject'),
+      text: z.string().optional().describe('Plain text body'),
+      html: z.string().optional().describe('HTML body'),
+      cc: z.union([z.string(), z.array(z.string())]).optional().describe('CC recipient(s)'),
+      bcc: z.union([z.string(), z.array(z.string())]).optional().describe('BCC recipient(s)'),
+    }
+  }, async ({ accountId, ...draft }) => {
+    const result = await imapService.saveDraft(accountId, draft);
+
+    return {
+      content: [{
+        type: 'text',
+        text: JSON.stringify(result, null, 2)
+      }]
+    };
+  });
+
+  // Set Apple Mail color flag tool
+  server.registerTool('imap_set_flag_color', {
+    description: 'Set a colored flag (⭐) on an email — appears as colored star in Apple Mail. Colors: red, orange, yellow, green, blue, purple. Pass null to remove color.',
+    inputSchema: {
+      accountId: z.string().describe('Account ID'),
+      folder: z.string().default('INBOX').describe('Folder name'),
+      uid: z.coerce.number().describe('Email UID'),
+      color: z.enum(['red', 'orange', 'yellow', 'green', 'blue', 'purple']).nullable().describe('Flag color, or null to remove'),
+    }
+  }, async ({ accountId, folder, uid, color }) => {
+    await imapService.setFlagColor(accountId, folder, uid, color);
+
+    return {
+      content: [{
+        type: 'text',
+        text: JSON.stringify({
+          success: true,
+          message: color ? `Email ${uid} flagged ${color}` : `Color flag removed from email ${uid}`,
         }, null, 2)
       }]
     };

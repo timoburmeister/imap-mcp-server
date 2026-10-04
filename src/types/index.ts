@@ -63,6 +63,8 @@ export interface Folder {
 export interface SearchCriteria {
   from?: string;
   to?: string;
+  cc?: string;
+  bcc?: string;
   subject?: string;
   body?: string;
   since?: Date;
@@ -71,6 +73,9 @@ export interface SearchCriteria {
   flagged?: boolean;
   answered?: boolean;
   draft?: boolean;
+  larger?: number;
+  smaller?: number;
+  or?: [SearchCriteria, SearchCriteria];
 }
 
 export interface ConnectionPool {

@@ -1,5 +1,6 @@
 import { ImapFlow } from 'imapflow';
 import { simpleParser } from 'mailparser';
+import MailComposer from 'nodemailer/lib/mail-composer/index.js';
 import { ImapAccount, EmailMessage, EmailContent, Folder, SearchCriteria } from '../types/index.js';
 import type { AccountManager } from './account-manager.js';
 
@@ -191,11 +192,22 @@ export class ImapService {
       console.log(`Reconnecting to account ${accountId} (attempt ${attempts + 1})`);
 
       try {
-        await state.client.connect();
-        state.isConnected = true;
+        // ImapFlow instances cannot be reconnected after close — discard and build a fresh client
+        try {
+          state.client.close();
+        } catch {
+          // ignore errors while discarding the dead client
+        }
+        this.connections.delete(accountId);
+        const account = this.accountManager?.getAccount(accountId) ?? state.account;
+        await this.connect(account);
+        const newState = this.connections.get(accountId);
+        if (!newState) {
+          throw new Error('Reconnect did not establish a connection state');
+        }
         this.reconnectAttempts.set(accountId, 0);
+        return newState.client;
       } catch (err) {
-        state.isConnected = false;
         throw new Error(`Failed to reconnect: ${enrichConnectionError(err, state.account.host)}`);
       }
     }
@@ -528,6 +540,34 @@ export class ImapService {
     }
   }
 
+  async markAsFlagged(accountId: string, folderName: string, uid: number): Promise<void> {
+    const client = await this.ensureConnected(accountId);
+
+    let lock;
+    try {
+      lock = await client.getMailboxLock(folderName);
+      await client.messageFlagsAdd(uid, ['\\Flagged'], { uid: true });
+    } finally {
+      if (lock) {
+        lock.release();
+      }
+    }
+  }
+
+  async markAsUnflagged(accountId: string, folderName: string, uid: number): Promise<void> {
+    const client = await this.ensureConnected(accountId);
+
+    let lock;
+    try {
+      lock = await client.getMailboxLock(folderName);
+      await client.messageFlagsRemove(uid, ['\\Flagged'], { uid: true });
+    } finally {
+      if (lock) {
+        lock.release();
+      }
+    }
+  }
+
   async deleteEmail(accountId: string, folderName: string, uid: number): Promise<void> {
     const client = await this.ensureConnected(accountId);
     const connState = this.connections.get(accountId);
@@ -623,6 +663,97 @@ export class ImapService {
         lock.release();
       }
     }
+  }
+
+  // Apple Mail color flag keywords (IMAP keywords for colored stars)
+  private static readonly FLAG_COLORS: Record<string, string> = {
+    red: '$MailFlagBit0',
+    orange: '$MailFlagBit1',
+    yellow: '$MailFlagBit2',
+    green: '$MailFlagBit3',
+    blue: '$MailFlagBit4',
+    purple: '$MailFlagBit5',
+  };
+
+  async saveDraft(accountId: string, draft: { from: string; to: string | string[]; subject: string; text?: string; html?: string; cc?: string | string[]; bcc?: string | string[] }): Promise<{ success: boolean; folder?: string; error?: string }> {
+    const client = await this.ensureConnected(accountId);
+    const folders = await this.listFolders(accountId);
+
+    const draftFolderNames = ['Drafts', 'Draft', 'INBOX.Drafts', '[Gmail]/Drafts', 'Entwürfe', 'Entwurfe'];
+    const draftFolder = folders.find(f => draftFolderNames.includes(f.name));
+
+    if (!draftFolder) {
+      return { success: false, error: `No Drafts folder found. Tried: ${draftFolderNames.join(', ')}` };
+    }
+
+    const composer = new MailComposer({ ...draft, date: new Date() });
+    const rawMessage = await new Promise<Buffer>((resolve, reject) => {
+      composer.compile().build((err: Error | null, msg: Buffer) => {
+        if (err) reject(err); else resolve(msg);
+      });
+    });
+
+    try {
+      await client.append(draftFolder.name, rawMessage, ['\\Draft', '\\Seen']);
+      return { success: true, folder: draftFolder.name };
+    } catch (err) {
+      return { success: false, error: err instanceof Error ? err.message : String(err) };
+    }
+  }
+
+  async setFlagColor(accountId: string, folderName: string, uid: number, color: string | null): Promise<void> {
+    const client = await this.ensureConnected(accountId);
+    const allColorKeywords = Object.values(ImapService.FLAG_COLORS);
+
+    let lock;
+    try {
+      lock = await client.getMailboxLock(folderName);
+      // Remove all existing color flags first
+      await client.messageFlagsRemove(uid, allColorKeywords, { uid: true });
+      // Set new color if specified
+      if (color && ImapService.FLAG_COLORS[color]) {
+        await client.messageFlagsAdd(uid, ['\\Flagged', ImapService.FLAG_COLORS[color]], { uid: true });
+      }
+    } finally {
+      if (lock) lock.release();
+    }
+  }
+
+  async createFolder(accountId: string, path: string): Promise<{ success: boolean; path: string }> {
+    const client = await this.ensureConnected(accountId);
+    const result = await client.mailboxCreate(path);
+    return { success: true, path: result.path };
+  }
+
+  async deleteFolder(accountId: string, path: string): Promise<{ success: boolean }> {
+    const client = await this.ensureConnected(accountId);
+    await client.mailboxDelete(path);
+    return { success: true };
+  }
+
+  async renameFolder(accountId: string, path: string, newPath: string): Promise<{ success: boolean; newPath: string }> {
+    const client = await this.ensureConnected(accountId);
+    const result = await client.mailboxRename(path, newPath);
+    return { success: true, newPath: result.newPath };
+  }
+
+  async getUnreadCountBatch(accountId: string, folders?: string[]): Promise<{ totalUnread: number; byFolder: Record<string, number> }> {
+    const client = await this.ensureConnected(accountId);
+    const listed = await client.list({ statusQuery: { unseen: true } });
+
+    const byFolder: Record<string, number> = {};
+    let totalUnread = 0;
+
+    for (const mailbox of listed) {
+      if (folders && !folders.includes(mailbox.path)) continue;
+      const unseen = mailbox.status?.unseen ?? 0;
+      if (unseen > 0 || !folders) {
+        byFolder[mailbox.path] = unseen;
+        totalUnread += unseen;
+      }
+    }
+
+    return { totalUnread, byFolder };
   }
 
   async appendToSentFolder(accountId: string, rawMessage: Buffer | string): Promise<boolean> {
@@ -723,6 +854,21 @@ export class ImapService {
     }
     if (criteria.draft !== undefined) {
       query.draft = criteria.draft;
+    }
+    if (criteria.cc) {
+      query.cc = criteria.cc;
+    }
+    if (criteria.bcc) {
+      query.bcc = criteria.bcc;
+    }
+    if (criteria.larger !== undefined) {
+      query.larger = criteria.larger;
+    }
+    if (criteria.smaller !== undefined) {
+      query.smaller = criteria.smaller;
+    }
+    if (criteria.or) {
+      query.or = [this.buildSearchQuery(criteria.or[0]), this.buildSearchQuery(criteria.or[1])];
     }
 
     // If no criteria, search all

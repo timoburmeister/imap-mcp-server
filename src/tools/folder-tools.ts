@@ -61,39 +61,75 @@ export function folderTools(
     };
   });
 
-  // Get unread count tool
+  // Get unread count tool (uses single LIST+STATUS command — no N+1)
   server.registerTool('imap_get_unread_count', {
-    description: 'Get the count of unread emails in specified folders',
+    description: 'Get the count of unread emails in specified folders (single IMAP round-trip)',
     inputSchema: {
       accountId: z.string().describe('Account ID'),
-      folders: z.array(z.string()).optional().describe('List of folders to check (default: all)'),
+      folders: z.array(z.string()).optional().describe('List of folders to check (default: all with unread)'),
     }
   }, async ({ accountId, folders }) => {
-    const allFolders = await imapService.listFolders(accountId);
-    const foldersToCheck = folders || allFolders.map(f => f.name);
-    
-    const unreadCounts: Record<string, number> = {};
-    let totalUnread = 0;
-    
-    for (const folderName of foldersToCheck) {
-      try {
-        const unreadMessages = await imapService.searchEmails(accountId, folderName, { seen: false });
-        const count = unreadMessages.length;
-        unreadCounts[folderName] = count;
-        totalUnread += count;
-      } catch (error) {
-        // Skip folders that can't be accessed
-        unreadCounts[folderName] = 0;
-      }
-    }
-    
+    const result = await imapService.getUnreadCountBatch(accountId, folders);
+
     return {
       content: [{
         type: 'text',
-        text: JSON.stringify({
-          totalUnread,
-          byFolder: unreadCounts,
-        }, null, 2)
+        text: JSON.stringify(result, null, 2)
+      }]
+    };
+  });
+
+  // Create folder tool
+  server.registerTool('imap_create_folder', {
+    description: 'Create a new IMAP folder/mailbox (use / as delimiter for subfolders, e.g. "_Mia/Wichtig")',
+    inputSchema: {
+      accountId: z.string().describe('Account ID'),
+      path: z.string().describe('Folder path to create'),
+    }
+  }, async ({ accountId, path }) => {
+    const result = await imapService.createFolder(accountId, path);
+
+    return {
+      content: [{
+        type: 'text',
+        text: JSON.stringify(result, null, 2)
+      }]
+    };
+  });
+
+  // Delete folder tool
+  server.registerTool('imap_delete_folder', {
+    description: 'Delete an IMAP folder/mailbox (must be empty)',
+    inputSchema: {
+      accountId: z.string().describe('Account ID'),
+      path: z.string().describe('Folder path to delete'),
+    }
+  }, async ({ accountId, path }) => {
+    const result = await imapService.deleteFolder(accountId, path);
+
+    return {
+      content: [{
+        type: 'text',
+        text: JSON.stringify(result, null, 2)
+      }]
+    };
+  });
+
+  // Rename folder tool
+  server.registerTool('imap_rename_folder', {
+    description: 'Rename or move an IMAP folder',
+    inputSchema: {
+      accountId: z.string().describe('Account ID'),
+      path: z.string().describe('Current folder path'),
+      newPath: z.string().describe('New folder path'),
+    }
+  }, async ({ accountId, path, newPath }) => {
+    const result = await imapService.renameFolder(accountId, path, newPath);
+
+    return {
+      content: [{
+        type: 'text',
+        text: JSON.stringify(result, null, 2)
       }]
     };
   });
