@@ -7,13 +7,122 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.1.0] - 2026-09-26
+
+No tool was renamed, and no existing input or output shape changed. The new
+fields below are optional.
+
 ### Added
+- `allowStartTLS` account option (#158). Setting `tls: false` only turns off implicit TLS. imapflow still upgrades via STARTTLS whenever the server advertises it, and checks the certificate against the host you connected to. Shared hosts such as DreamHost advertise STARTTLS behind a wildcard certificate that does not match, so plain accounts failed there. Set `allowStartTLS: false` to stay on the plain connection. Available in `imap_add_account`, `imap_update_account` and `imap_list_accounts`. Defaults to `true`, so existing behavior is unchanged.
+- Outgoing attachments are validated before SMTP is contacted (#161). Invalid base64, unreadable paths, missing filenames, ambiguous sources, and inline attachments without `cid` now fail with a clear error. Base64 wrapped at 76 columns is accepted. `imap_send_email` gains an optional `dryRun` that validates attachments and builds the MIME without sending anything. Successful sends and dry runs report `attachmentCount` and `attachmentDiagnostics`: filename, type, size, source, disposition and cid, but no content and no local paths.
+
+### Fixed
+- `imap_search_emails` and the other SEARCH-based tools work again on Strato (#138). Strato's IMAP server returns an empty result for every SEARCH, while FETCH still works. When a SEARCH comes back empty for a folder that is not empty, and `SEARCH ALL` is empty as well, the server now fetches the envelopes and applies the criteria itself. This covers `imap_search_emails`, `imap_find_thread_messages` (In-Reply-To/References matched over fetched headers), unread counts and spam analysis. A `body` search parses only the candidates left after the other criteria, up to 2000. The deleting tools (`imap_bulk_delete_by_search`, `imap_delete_spam`, `imap_delete_by_domain`) deliberately do not use this fallback and return an explicit error instead. On servers where SEARCH works, the only change is one extra `SEARCH ALL` when a search finds nothing. Tests in `tests/imap-service-search-fallback.test.ts`.
+- `imap-setup` wrote a path relative to the current directory into `claude_desktop_config.json`, so a globally installed wizard produced a server path that did not exist and Claude Desktop reported only `Connection closed` (#177, #178). The path is now resolved from the module's own location, and the absolute Node binary (`process.execPath`) is written instead of a bare `node`. Apps started from the macOS GUI do not inherit the shell PATH.
+- `imap_save_draft` and the Sent copy of `imap_send_email` failed on strict servers such as Cyrus for any multi-line body (#170). Text and HTML bodies are now normalized to CRLF before composing. SMTP delivery itself was never affected.
+- `imap_download_attachment` finds attachments whose names arrive in Unicode NFD form, which macOS senders use, when given the NFC spelling (#168). A `contentId` also works without angle brackets.
+- An attachment without `contentType` keeps nodemailer's extension-based type detection again, so a `.pdf` goes out as `application/pdf`.
+- `imap_save_draft` and Sent-folder copies now keep `Bcc` headers in the stored MIME. Nodemailer's `MailComposer` omits Bcc from the built message by default (SMTP envelope only), so even when `defaultBcc` / a call-site `bcc` was merged into the composer, the appended draft or Sent copy had no `Bcc:` line and mail clients showed an empty BCC field. `SmtpService.composeRaw` now sets `keepBcc` on the compiled message. SMTP delivery was already correct; only the IMAP-stored copy was missing the header. Tests in `tests/smtp-service-compose-raw-bcc.test.ts`.
+
+### Changed
+- Dependency majors: `imapflow` 1.7 → 2.0, `nodemailer` 9 → 10, `dotenv` 17 → 18. dotenv now writes its status line to stderr instead of stdout, so it can no longer interfere with the stdio MCP channel. Dev dependency: `vitest` 5.
+
+### Security
+- Two dependency advisories cleared — `npm audit` reports 0 vulnerabilities again, with no source changes. `html-to-text` → `^10.0.1` pulls in `deepmerge-ts` 8.0.1 (GHSA-ggr8-5vv4-36mx, stack exhaustion when merging recursive object graphs); this is the one that matters, because it sits on a **runtime** path via `mailparser` → `html-to-text`. `mailparser` pins `html-to-text` to exactly `10.0.0`, so the fix cannot arrive on its own — the override deliberately supersedes that pin. Upstream 10.0.1 is a patch whose only change is that same `deepmerge-ts` bump. `nanoid` → `^3.3.18` (GHSA-2v37-7h3g-55p8, custom generators can loop indefinitely when size is zero) is dev-scope only, reached through `vitest` → `vite` → `postcss`.
+
+  As in #144, the CI `security` job (`npm audit --audit-level=high`) had started failing on `main` itself, which turns every open pull request red regardless of its content and blocks `dependabot-auto-merge.yml`.
+
+## [2.0.0] - 2026-08-05
+
+Major only because of the Node requirement. **No tool was renamed, and no tool's
+input or output shape changed** — if you are already on Node 22.12 or newer,
+upgrading from 1.6.0 needs no changes on your side.
+
+### Breaking Changes
+- **Minimum supported Node.js is now 22.12** (previously documented as 18). Check yours with `node --version`; if it is older, upgrade Node or stay on 1.6.x.
+
+  This formalizes what the dependency tree already required rather than introducing a new restriction: 11 runtime packages already excluded Node 18 — four of them direct dependencies — and `commander@15` needs >=22.12, while CI still tested on 20.x. That job passed only because npm's `EBADENGINE` is a warning and the tests never reach the affected code. Node 18 reached end-of-life in April 2025, Node 20 in April 2026.
+
+  `package.json` now declares `engines.node`, which it never did before, and the CI matrix moves to 22.x/24.x.
+
+### Added
+- `tests/node-engines.test.ts` guards the advertised Node floor against the actual runtime dependency tree. npm does not do this itself: it validates a dependency's `engines` against the Node performing the install, not against the floor the package declares — so a dependency requiring a newer Node installs silently and only breaks on a user's older runtime. That gap is how #108 reached users. The test walks the lockfile's runtime entries and fails with the offending package names when any of them needs more than we advertise. Dev dependencies are excluded.
+
+### Changed
+- `chalk` 5.6.2 → 6.0.0 (#134). Used only for coloured console output in `imap-setup`. It requires Node >=22, which the new floor covers.
+
+### Fixed
+- `imap_get_latest_emails` no longer depends on IMAP SEARCH (#138). Opening a mailbox already reports how many messages it holds, and IMAP orders sequence numbers by arrival — so the newest `count` messages are just the tail of that range. The tool used to call `client.search({ all: true })` first and return `[]` whenever that came back empty, which is what a Strato mailbox does despite reporting a non-zero message count via STATUS. Fetching the tail by sequence number instead removes one round-trip on every call and makes the tool independent of the server's SEARCH behavior. The SEARCH path is kept as a fallback for the case where the mailbox metadata is unavailable. Tests in `tests/imap-service-latest-no-search.test.ts`. Criteria-based `imap_search_emails` still requires SEARCH and is unaffected.
+
+## [1.6.0] - 2026-08-05
+
+### Added
+- Optional per-account `defaultBcc` (#143). Set a BCC once on the account — e.g. your own inbox as an archive copy — and every `imap_send_email`, `imap_save_draft`, `imap_reply_to_email` and `imap_forward_email` includes it automatically. Configured via `imap_add_account` / `imap_update_account` (an empty string or empty array clears it) and the web wizard. A call-site `bcc` still works and is merged in: explicit addresses first, then the defaults, deduplicated case-insensitively on the bare address so `Archive@Me.com` and `archive@me.com` collapse into one. `imap_reply_to_email` and `imap_forward_email` gain an optional `bcc` parameter, which they previously lacked. Tests in `tests/default-bcc.test.ts`.
+- Environment-variable overrides for account credentials (#135). IMAP/SMTP username and password of an **existing** account can be supplied at runtime via `IMAP_MCP_ACCOUNT_<NAME>_IMAP_USERNAME` / `_IMAP_PASSWORD` / `_SMTP_USERNAME` / `_SMTP_PASSWORD`, so secrets can come from a password manager or CI secret store instead of `accounts.json`. `<NAME>` is the account name uppercased with every non-alphanumeric character replaced by `_`. Overrides are in-memory only and never written back. The variables are consumed once in the `AccountManager` constructor — captured into an encrypted cache and deleted from `process.env` so the plaintext does not linger where it could be inherited by child processes. The setup wizard gains a "Do not save to config" checkbox per credential field and displays the exact variable name to export. When a credential is marked env-managed but the variable was not set at startup, `ImapService.connect` / `SmtpService.createTransporter` now fail with the missing variable's name (`src/utils/env-credentials.ts`) rather than dialing out with a blank credential and surfacing a generic authentication failure. Tests in `tests/account-manager.test.ts` and `tests/env-credentials.test.ts`.
+
+### Fixed
+- `imap_folder_status` no longer throws `Cannot read properties of undefined (reading 'total')` (#138). The handler read node-imap's `box.messages.total` / `.new` / `.unseen` off the result of `mailboxOpen()`, but imapflow's `MailboxObject` has no `messages` property at all — so the tool failed on **every** provider, not just Strato. Counts now come from IMAP STATUS via `ImapService.getFolderStatus()` (which also supplies the RECENT and UNSEEN values `mailboxOpen()` never reports), issued before SELECT because RFC 3501 discourages STATUS against the currently selected mailbox. Two further shape bugs in the same response are fixed alongside: `uidvalidity` / `uidnext` were read in the wrong case (`box.uidvalidity` vs imapflow's `uidValidity`) and always serialized as `undefined`, and `flags` / `permanentFlags` are `Set`s that `JSON.stringify` rendered as `{}` — both now emit real values, the flag lists as arrays. Output keys are unchanged. The bug survived because `tests/folder-tools-status.test.ts` mocked `selectFolder` with node-imap's shape; the mock now mirrors imapflow's `MailboxObject` and all seven cases fail against the old implementation.
+- `npm run web` no longer exits silently on Windows (#136). The CLI entry-point guard in `src/web/server.ts` compared `import.meta.url` against `` `file://${process.argv[1]}` ``; on Windows that yields `file://C:\...\server.ts` while `import.meta.url` is `file:///C:/.../server.ts`, so the two could never match and the process exited 0 without starting the server. Uses `pathToFileURL(process.argv[1]).href`, which normalizes identically on every platform.
+- Recipients passed as an array no longer bounce (#127). `to`/`cc`/`bcc`/`references`/`uid` are Zod unions, which the SDK renders as JSON Schema `anyOf`; some MCP clients drop the `anyOf` before showing the schema to the model and then serialize the model's array into a string, so the server received `'["a@x.com","b@y.com"]'`. nodemailer folded the literal brackets into the first and last address (`<"[ alice"@example.com>`), and every recipient was rejected by the receiving MTA — a silent 100% delivery failure. New `parseSerializedArray` helper (`src/utils/array-input.ts`) restores the array, applied both as a Zod `preprocess` on every affected tool input and again in `SmtpService.toMailOptions()` so no caller path can reach nodemailer with a bracket string. Recovery is logged to stderr (field name and item count only, never the addresses). Real arrays, plain addresses, comma-separated strings and domain literals (`user@[192.168.1.1]`) are untouched, and the published tool schemas are unchanged. Tests in `tests/serialized-array-input.test.ts`.
+- Sent-folder save failures are reported instead of swallowed, plus a per-account `sentFolder` override (#126). A copy of an outbound message that failed to append to Sent used to be silently dropped, so the tool reported plain success while nothing landed in the folder. Send/reply/forward now surface the save outcome, and an account can name its Sent folder explicitly for providers whose special-use flags are unreliable.
+
+### Security
+- All open dependency advisories cleared — `npm audit` reports 0 vulnerabilities (#144). Resolves 9 Dependabot alerts (2 high, 7 medium), all in transitive dependencies, with no source changes: `@modelcontextprotocol/sdk` → `^1.30.0` (whose widened `@hono/node-server` range makes the 2.x override resolvable), `hono` → `^4.13.0` (CORS ReDoS, `hono/jsx` cross-request context leak, `cx()` XSS bypass, API-Gateway header de-duplication), `@hono/node-server` → `^2.0.5` (`serve-static` path traversal on Windows via `%5C`), `fast-uri` → `^3.1.4` (host confusion via backslash authority / failed IDN canonicalization), `ip-address` → `^10.4.0` (SSRF and trust-boundary bypass via leading-zero octets, CIDR suffix, and IPv4-mapped/NAT64 misclassification), plus the dev-scope `brace-expansion` → `^5.0.9` and `postcss` → `^8.5.23`. The CI `security` job had been failing on `main` itself, which turned every open pull request red regardless of its content.
+
+### Tests
+- New `tests/serialized-array-input.test.ts` (23 cases) covering the recovery helper itself, the tool schemas (`imap_send_email`, `imap_save_draft`, `imap_forward_email`, `imap_mark_as_read`, `imap_move_email`), the published JSON Schema staying byte-identical, and the composed MIME header via `SmtpService.composeRaw` — including the negative cases that must stay untouched.
+- New `tests/env-credentials.test.ts` (12 cases) covering the env-variable naming, the unset-variable guard for both the IMAP and SMTP paths, and parity between the server-side `envVarName()` and its copy in `public/js/app.js` (the wizard is a static asset and cannot import the module).
+
+## [1.5.1] - 2026-07-16
+
+Released without changelog entries at the time; recorded here retroactively. The
+entries below shipped in 1.5.1, not in 1.6.0. 1.5.2 followed the same day with a
+further credential-scrubbing fix for the web wizard's account routes.
+
+### Added
+- `includeBody` option on `imap_search_emails`, `imap_get_latest_emails`, and `imap_find_thread_messages` (#106). When set, the response includes the parsed body alongside the existing headers in a single tool call — no more N+1 round-trips of `search → N × imap_get_email`. Backed by three new optional params: `includeBody` (default false), `bodyFormat` (`markdown`/`text`/`html`/`auto`, default `markdown`), `bodyMaxLength` (per-field cap, default 10000). The body-rendering path is shared with `imap_get_email` via a refactored `buildEmailContentFromSource` helper. **Documented limitation:** `includeBody` is honored on the single-folder search path only; the cross-folder path keeps the lightweight header shape to avoid multiplying source-byte fetches across folders — follow up with `imap_get_email` for the specific uids whose bodies you need.
+- Batch UID support on `imap_move_email`, `imap_mark_as_read`, and `imap_mark_as_unread` (#106). `uid` now accepts either a single UID or an array of UIDs. Batch moves go through a single `imap_move` per UID with per-uid results attributed in the response; batch flag operations use one IMAP STORE sequence-set (atomic at the server level). Single-UID callers see the legacy response shape unchanged.
+- New `SearchOptions` interface in `src/types/index.ts` (with `DEFAULT_BODY_MAX_LENGTH` / `DEFAULT_BODY_FORMAT` constants) so search-criteria and output-shaping options stay cleanly separated.
+
+### Fixed
+- `imap_search_emails` single-folder path now returns the **newest** matches when `limit` cuts the result (#107). The service returns UIDs in ascending order (oldest first), and the tool used to `slice(0, limit)` directly, so callers received the oldest matches. Sort by `internalDate` DESC before applying `limit`, matching the cross-folder search path. Tests in `tests/email-tools-search-all.test.ts`.
+- `imap-setup` CLI no longer crashes with `SyntaxError: Invalid regular expression flags` on Node 18 (#108). The crash was triggered transitively by `ora@9` → `string-width@8.2.1`, which uses the regex `/v` flag (Unicode set mode, requires Node ≥20). Pinned `string-width` to `^7.2.0` via npm `overrides`; tests in `tests/dependencies.test.ts` walk `node_modules` to ensure no transitive copy of `string-width@8.x` sneaks back in.
+
+### Tests
+- New `tests/email-tools-include-body-and-batch.test.ts` (14 cases) covering backwards compat + `includeBody` propagation + body-format options + batch UID happy path and partial failure. Existing `tests/email-tools-search-all.test.ts` and `tests/email-tools-thread.test.ts` updated to match the new option-arg shapes.
+
+## [1.5.0] - 2026-06-27
+
+### Added
+- `imap_search_emails` cross-folder search (based on #92 by @jrejaud). New optional `searchAllFolders` flag scans every selectable mailbox at once — catching messages filed away by rules into custom folders — instead of only `folder`. Trash/Spam/Drafts and non-selectable (`\Noselect`) folders are skipped by default and can be opted back in via `includeTrash`/`includeSpam`/`includeDrafts`. Noisy folders are detected via RFC 6154 SPECIAL-USE flags with a name-based fallback (leaf-aware, case-insensitive). Results gain a per-message `folder` field plus `foldersSearched`, and any folder that fails to open is reported in `foldersErrored` rather than silently swallowed (a 0-result answer is never ambiguous). Default single-folder behavior is unchanged. Helper extracted to `src/utils/search-folders.ts`; tests in `tests/search-folders.test.ts` and `tests/email-tools-search-all.test.ts`.
+
+### Changed
+- Dependency updates (applied directly; Dependabot couldn't rebase its PRs due to a resolver issue with vitest 4's wasm bindings): `zod` 3 → 4, `typescript` 5 → 6, `commander` 14 → 15, `open` 10 → 11, `ora` 8 → 9, `@types/node` 24 → 26. TypeScript 6 needed `ignoreDeprecations: "6.0"` for the `node` module-resolution mode. `pdf-parse` was intentionally **not** upgraded to 2.x (breaking ESM rewrite that removes the `pdf-parse/lib/pdf-parse.js` entry point this server uses).
+
+### Fixed
+- CI `lint` job (`tsc --noEmit`) no longer OOM-kills. The root cause was the deep `registerTool` + zod-3 generic instantiation (`TS2589`); upgrading to **zod 4** (flatter types) makes the type-check finish in <1s instead of OOM-ing. As a result the interim heap workaround and all 9 `@ts-expect-error TS2589` suppressions were removed, and main's CI is green again.
+
+## [1.4.0] - 2026-06-27
+
+### Added
+- Selective tool access via environment variables (Issue #87). `IMAP_MCP_READ_ONLY` (truthy: `1`/`true`/`yes`/`on`) registers only the safe, read-only subset — searching, reading, listing folders, unread counts, and spam analysis — and exposes no tool that sends mail, deletes/moves messages, changes flags, or edits accounts. `IMAP_MCP_ENABLED_TOOLS` is a comma-separated allowlist (case-insensitive, `imap_` prefix optional) that takes precedence over `IMAP_MCP_READ_ONLY`. With neither set, all tools are registered (unchanged default). Unknown tool names are ignored with a warning on stderr. Gating is applied in `src/tools/index.ts` via a server wrapper, so individual tool files are untouched. Tests: `tests/tool-access.test.ts`.
+
+## [1.3.0] - 2026-06-17
+
+### Added
+- `imap_find_email_by_message_id` tool — resolve a stable RFC822 Message-ID to its current `{folder, uid}` across folders, robust to the message having been moved/archived (IMAP UIDs are folder-relative). Gmail `\All` fast path; generic INBOX → `\Archive` → `\Sent` → remaining folders. Exact-match verification against `envelope.messageId` rejects HEADER substring false-positives. Returns basic envelope + `foldersSearched` diagnostic.
+- `messageId` search criterion on `imap_search_emails` (maps to IMAP `HEADER MESSAGE-ID`, substring-matched).
 - `imap_get_email` options to control body and text-attachment output (`maxContentLength`, `includeAttachmentText`, `maxAttachmentTextChars`).
 - Text attachment preview fields in email payloads (`attachments[].textContent`, `attachments[].textContentTruncated`).
+- `imap_get_email` `bodyFormat` parameter (`markdown` default, `text`, `html`, `auto`) and a `markdownContent` body field. The body is converted to clean Markdown server-side (Turndown + the GFM strikethrough plugin), with email-specific rules: layout tables flattened, hidden/preheader nodes stripped, `<img>` reduced to its alt text, tracking URLs shortened.
 
 ### Changed
 - `imap_get_email` now reports body truncation via `contentTruncated`.
+- `imap_get_email` returns the body as Markdown by default and omits raw `htmlContent` unless `bodyFormat: "html"` is requested, so large HTML emails (a single marketing mail can be ~119k characters of markup) no longer cross the MCP boundary. `textContent` is still included for backward compatibility.
 - Text extraction only runs for text-like attachments and enforces size limits to avoid binary bloat.
+
+### Fixed
+- Reconnect after an idle connection drop no longer fails with `Can not re-use ImapFlow instance`. ImapFlow instances are single-use, so `ImapService.ensureConnected` now tears down the dead client and constructs a fresh `ImapFlow` (via `connect()`) instead of calling `.connect()` on the stale object. This affected every multi-step IMAP workflow where the socket idled out between two tool calls (e.g. an `imap_connect` followed minutes later by an `imap_move_email`). Regression test: `tests/imap-service-reconnect.test.ts`.
 
 ## [1.1.0] - 2025-12-18
 

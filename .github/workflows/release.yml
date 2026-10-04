@@ -1,0 +1,113 @@
+name: Release
+
+# Publishes to npm and the official MCP Registry whenever a version tag is pushed.
+#
+# Trigger:  git tag vX.Y.Z && git push origin vX.Y.Z
+#           or re-run manually from main (Actions → Release → Run workflow): an
+#           already-published npm version is skipped, the registry step retried.
+#
+# Requirements (one-time setup):
+#   - npm Trusted Publisher: on npmjs.com -> package "imap-mcp-server" ->
+#     Settings -> Trusted Publishers -> add GitHub Actions with
+#     Organization/user = nikolausm, Repository = imap-mcp-server,
+#     Workflow filename = release.yml (Environment left empty). This lets CI
+#     publish via OIDC with NO npm token and bypasses the 2FA publish policy.
+#     Provenance attestations are generated automatically.
+#   - No secret is needed for the MCP Registry either: authentication uses
+#     GitHub OIDC (`mcp-publisher login github-oidc`), which works because the
+#     registry namespace `io.github.nikolausm/*` matches this repo owner.
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write   # required for npm Trusted Publishing AND mcp-publisher's GitHub OIDC login
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: '24'   # ships npm 11.x (>= 11.5.1); Node >= 22.14 required
+          package-manager-cache: false   # no caching in release builds
+          # IMPORTANT: no `registry-url` here. With it, setup-node writes an
+          # .npmrc containing a placeholder NODE_AUTH_TOKEN (XXXXX-...). That
+          # dummy token shadows OIDC, so `npm publish` authenticates as
+          # anonymous and the registry returns a misleading 404 Not Found.
+
+      - name: Upgrade npm for Trusted Publishing
+        run: npm install -g npm@latest   # ensure npm >= 11.5.1 for OIDC handshake
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Verify version consistency
+        run: |
+          # A manual run (workflow_dispatch) from a branch has no tag to compare
+          # against; it re-publishes whatever version package.json declares.
+          if [ "$GITHUB_REF_TYPE" = "tag" ]; then
+            TAG_VERSION="${GITHUB_REF_NAME#v}"
+          else
+            TAG_VERSION=$(node -p "require('./package.json').version")
+          fi
+          PKG_VERSION=$(node -p "require('./package.json').version")
+          SRV_VERSION=$(node -p "require('./server.json').version")
+          SRV_PKG_VERSION=$(node -p "require('./server.json').packages[0].version")
+          MCP_NAME=$(node -p "require('./package.json').mcpName")
+          SRV_NAME=$(node -p "require('./server.json').name")
+          echo "tag=$TAG_VERSION package.json=$PKG_VERSION server.json=$SRV_VERSION server.packages[0]=$SRV_PKG_VERSION"
+          if [ "$TAG_VERSION" != "$PKG_VERSION" ] || [ "$PKG_VERSION" != "$SRV_VERSION" ] || [ "$SRV_VERSION" != "$SRV_PKG_VERSION" ]; then
+            echo "::error::Version mismatch between tag, package.json and server.json"
+            exit 1
+          fi
+          if [ "$MCP_NAME" != "$SRV_NAME" ]; then
+            echo "::error::package.json mcpName ($MCP_NAME) != server.json name ($SRV_NAME)"
+            exit 1
+          fi
+          echo "Versions and names are consistent."
+
+      - name: Build
+        run: npm run build
+
+      - name: Test
+        run: npm test
+
+      - name: Publish to npm (Trusted Publishing via OIDC)
+        # Skipped when this version is already on npm, so a run that failed at a
+        # later step (e.g. the MCP Registry below) can simply be re-run.
+        run: |
+          VERSION=$(node -p "require('./package.json').version")
+          if npm view "imap-mcp-server@$VERSION" version >/dev/null 2>&1; then
+            echo "imap-mcp-server@$VERSION is already on npm — skipping publish."
+          else
+            npm publish   # no token: OIDC authenticates, provenance is automatic
+          fi
+
+      - name: Install mcp-publisher
+        run: |
+          curl -fsSL "https://github.com/modelcontextprotocol/registry/releases/latest/download/mcp-publisher_linux_amd64.tar.gz" \
+            | tar -xz mcp-publisher
+          ./mcp-publisher --help >/dev/null
+
+      - name: Authenticate with MCP Registry (GitHub OIDC)
+        run: ./mcp-publisher login github-oidc
+
+      - name: Publish to MCP Registry
+        # The registry validates the version against npm, which can take a few
+        # minutes to serve a fresh publish (v2.1.0 failed with a 404 here).
+        run: |
+          for attempt in $(seq 1 10); do
+            if ./mcp-publisher publish; then exit 0; fi
+            echo "Attempt $attempt failed — waiting for npm to serve the new version…"
+            sleep 60
+          done
+          exit 1

@@ -2,7 +2,8 @@ import express from 'express';
 import cors from 'cors';
 import bodyParser from 'body-parser';
 import path from 'path';
-import { fileURLToPath } from 'url';
+import fs from 'fs';
+import { fileURLToPath, pathToFileURL } from 'url';
 import open from 'open';
 import { AccountManager } from '../services/account-manager.js';
 import { ImapService } from '../services/imap-service.js';
@@ -12,26 +13,106 @@ import { ImapAccount } from '../types/index.js';
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
+// Strip credentials before an account crosses the wizard's HTTP boundary. The
+// API is unauthenticated and CORS-open, so any local page could otherwise read
+// plaintext IMAP/SMTP passwords out of a response. Returns a shallow copy with
+// `password` and `smtp.password` removed.
+function stripAccountSecrets<T extends Record<string, any>>(account: T): Omit<T, 'password'> {
+  const { password: _password, ...rest } = account;
+  const safe: Record<string, any> = { ...rest };
+  if (safe.smtp && typeof safe.smtp === 'object' && 'password' in safe.smtp) {
+    safe.smtp = { ...safe.smtp };
+    delete safe.smtp.password;
+  }
+  return safe as Omit<T, 'password'>;
+}
+
 export class WebUIServer {
   private app: express.Application;
   private accountManager: AccountManager;
   private imapService: ImapService;
   private port: number;
 
-  constructor(port: number = 3000) {
+  constructor(
+    port: number = 3000,
+    deps: { accountManager?: AccountManager; imapService?: ImapService } = {},
+  ) {
     this.app = express();
     this.port = port;
-    this.accountManager = new AccountManager();
-    this.imapService = new ImapService();
-    
+    this.accountManager = deps.accountManager ?? new AccountManager();
+    this.imapService = deps.imapService ?? new ImapService();
+
     this.setupMiddleware();
     this.setupRoutes();
   }
 
+  /** The configured Express application. Exposed for tests. */
+  getApp(): express.Application {
+    return this.app;
+  }
+
   private setupMiddleware(): void {
+    // The setup wizard is unauthenticated and CORS-open, so it must never be
+    // reachable by anything other than the local user's own browser. Reject
+    // any request whose Host is not a loopback name (blocks DNS-rebinding, where
+    // a malicious site points its own domain at 127.0.0.1) and any cross-origin
+    // browser request (Origin set to a non-loopback origin). Together with
+    // stripAccountSecrets this closes the "any open page can read/modify the
+    // local accounts API" vector.
+    this.app.use(this.loopbackOnly());
     this.app.use(cors());
     this.app.use(bodyParser.json());
-    this.app.use(express.static(path.join(__dirname, '../../public')));
+    this.app.use(express.static(this.resolvePublicDir()));
+  }
+
+  private static isLoopbackName(name: string): boolean {
+    const n = name.toLowerCase();
+    return n === 'localhost' || n === '127.0.0.1' || n === '::1';
+  }
+
+  // Guard: allow only loopback Host + (when present) loopback Origin. Non-browser
+  // clients (curl, tests) send no Origin and are allowed if the Host is loopback.
+  private loopbackOnly(): express.RequestHandler {
+    const hostname = (hostHeader: string): string =>
+      hostHeader.replace(/:\d+$/, '').replace(/^\[|\]$/g, '');
+
+    return (req, res, next) => {
+      const host = req.headers.host;
+      if (!host || !WebUIServer.isLoopbackName(hostname(host))) {
+        res.status(403).json({ error: 'Forbidden: the setup API is reachable on loopback only.' });
+        return;
+      }
+
+      const origin = req.headers.origin;
+      if (origin) {
+        let originHost: string;
+        try {
+          originHost = new URL(origin).hostname;
+        } catch {
+          res.status(403).json({ error: 'Forbidden: invalid Origin.' });
+          return;
+        }
+        if (!WebUIServer.isLoopbackName(originHost)) {
+          res.status(403).json({ error: 'Forbidden: cross-origin requests are not allowed.' });
+          return;
+        }
+      }
+
+      next();
+    };
+  }
+
+  // The bundled entrypoint may live at dist/web/server.js (npm run web) or be
+  // inlined into dist/setup.js, so __dirname differs. Probe the likely
+  // locations and fall back to the current working directory.
+  private resolvePublicDir(): string {
+    const candidates = [
+      path.join(__dirname, '../../public'),
+      path.join(__dirname, '../public'),
+      path.join(process.cwd(), 'public'),
+    ];
+    const found = candidates.find(dir => fs.existsSync(path.join(dir, 'index.html')));
+    return found ?? candidates[0];
   }
 
   private setupRoutes(): void {
@@ -44,7 +125,8 @@ export class WebUIServer {
     this.app.get('/api/accounts', (req, res) => {
       try {
         const accounts = this.accountManager.getAllAccounts();
-        res.json(accounts);
+        // Never send credentials to the client — see stripAccountSecrets.
+        res.json(accounts.map(stripAccountSecrets));
       } catch (error) {
         res.status(500).json({ error: 'Failed to fetch accounts' });
       }
@@ -53,13 +135,17 @@ export class WebUIServer {
     // Add new account
     this.app.post('/api/accounts', async (req, res) => {
       try {
-        const { name, email, password, host, port, tls, smtp, imapUsername } = req.body;
-        
+        const {
+          name, email, password, host, port, tls, smtp, imapUsername, sentFolder, defaultBcc,
+          imapUsernameFromEnv, imapPasswordFromEnv,
+          smtpUsernameFromEnv, smtpPasswordFromEnv,
+        } = req.body;
+
         // Auto-detect provider if not specified
         let imapHost = host;
         let imapPort = port;
         let useTls = tls;
-        
+
         if (!host && email) {
           const provider = getProviderByEmail(email);
           if (provider) {
@@ -68,19 +154,32 @@ export class WebUIServer {
             useTls = provider.imapSecurity !== 'STARTTLS';
           }
         }
-        
+
+        // Credentials flagged as env-managed are stored as empty placeholders;
+        // the corresponding IMAP_MCP_ACCOUNT_* env var supplies them at runtime.
         const account = await this.accountManager.addAccount({
           name: name || email,
           host: imapHost,
           port: imapPort || 993,
-          user: imapUsername || email,
-          password,
+          user: imapUsernameFromEnv ? '' : (imapUsername || email),
+          password: imapPasswordFromEnv ? '' : password,
           tls: useTls !== false,
-          ...(imapUsername ? { email } : {}),
-          smtp: smtp || undefined,
+          ...(imapUsername || imapUsernameFromEnv ? { email } : {}),
+          smtp: smtp
+            ? {
+                ...smtp,
+                ...(smtpUsernameFromEnv ? { user: '' } : {}),
+                ...(smtpPasswordFromEnv ? { password: '' } : {}),
+              }
+            : undefined,
+          ...(typeof sentFolder === 'string' && sentFolder ? { sentFolder } : {}),
+          ...(defaultBcc !== undefined && defaultBcc !== '' && !(Array.isArray(defaultBcc) && defaultBcc.length === 0)
+            ? { defaultBcc }
+            : {}),
         });
-        
-        res.json({ success: true, account });
+
+        // addAccount returns the plaintext password back; never echo it.
+        res.json({ success: true, account: stripAccountSecrets(account) });
       } catch (error) {
         res.status(400).json({ 
           success: false, 
@@ -142,26 +241,57 @@ export class WebUIServer {
     // Update account
     this.app.put('/api/accounts/:id', async (req, res) => {
       try {
-        const { name, email, password, host, port, tls, smtp, saveToSent, imapUsername } = req.body;
+        const {
+          name, email, password, host, port, tls, smtp, saveToSent, imapUsername, sentFolder, defaultBcc,
+          imapUsernameFromEnv, imapPasswordFromEnv,
+          smtpUsernameFromEnv, smtpPasswordFromEnv,
+        } = req.body;
 
         const updates: any = {};
         if (name !== undefined) updates.name = name;
-        if (imapUsername) {
+        // Env-managed username → store an empty placeholder for it.
+        if (imapUsernameFromEnv) {
+          updates.user = '';
+          if (email !== undefined) updates.email = email;
+        } else if (imapUsername) {
           updates.user = imapUsername;
           if (email !== undefined) updates.email = email;
         } else if (email !== undefined) {
           updates.user = email;
           updates.email = undefined;
         }
-        if (password !== undefined) updates.password = password;
+        // Env-managed password → empty placeholder; otherwise only update when sent.
+        if (imapPasswordFromEnv) {
+          updates.password = '';
+        } else if (password !== undefined) {
+          updates.password = password;
+        }
         if (host !== undefined) updates.host = host;
         if (port !== undefined) updates.port = port;
         if (tls !== undefined) updates.tls = tls;
-        if (smtp !== undefined) updates.smtp = smtp;
+        if (smtp !== undefined) {
+          updates.smtp = {
+            ...smtp,
+            ...(smtpUsernameFromEnv ? { user: '' } : {}),
+            ...(smtpPasswordFromEnv ? { password: '' } : {}),
+          };
+        }
         if (saveToSent !== undefined) updates.saveToSent = saveToSent;
-        
+        // Empty string clears the override (falls back to auto-detection).
+        if (typeof sentFolder === 'string') updates.sentFolder = sentFolder === '' ? undefined : sentFolder;
+        if (defaultBcc !== undefined) {
+          if (defaultBcc === '' || (Array.isArray(defaultBcc) && defaultBcc.length === 0)) {
+            updates.defaultBcc = undefined;
+          } else {
+            updates.defaultBcc = defaultBcc;
+          }
+        }
+
+        // updateAccount returns a DECRYPTED account (plaintext IMAP + SMTP
+        // passwords). A no-op update (e.g. a rename with no password supplied)
+        // would otherwise hand every stored secret back over the wire — strip.
         const account = await this.accountManager.updateAccount(req.params.id, updates);
-        res.json({ success: true, account });
+        res.json({ success: true, account: stripAccountSecrets(account) });
       } catch (error) {
         res.status(400).json({ 
           success: false, 
@@ -177,17 +307,8 @@ export class WebUIServer {
         if (!account) {
           res.status(404).json({ success: false, error: 'Account not found' });
         } else {
-          // Don't send passwords to client
-          const { password, ...accountWithoutPassword } = account;
-          const safeAccount = { ...accountWithoutPassword };
-          
-          // Remove SMTP password if present
-          if (safeAccount.smtp?.password) {
-            safeAccount.smtp = { ...safeAccount.smtp };
-            delete safeAccount.smtp.password;
-          }
-          
-          res.json({ success: true, account: safeAccount });
+          // Don't send passwords to client — see stripAccountSecrets.
+          res.json({ success: true, account: stripAccountSecrets(account) });
         }
       } catch (error) {
         res.status(400).json({ 
@@ -258,7 +379,10 @@ export class WebUIServer {
 }
 
 // CLI entry point
-if (import.meta.url === `file://${process.argv[1]}`) {
+// pathToFileURL, not `file://${argv[1]}`: on Windows the latter yields
+// "file://C:\...\server.ts" while import.meta.url is "file:///C:/.../server.ts",
+// so the two could never match and `npm run web` exited silently (#136).
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   const port = parseInt(process.env.PORT || '3000');
   const server = new WebUIServer(port);
   server.start();

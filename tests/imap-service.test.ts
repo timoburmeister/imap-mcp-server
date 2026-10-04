@@ -13,10 +13,11 @@ class MockImapFlow {
   public searchMock = vi.fn().mockResolvedValue([]);
   public fetchMock = vi.fn();
   public fetchOneMock = vi.fn().mockResolvedValue(null);
-  public messageFlagsAddMock = vi.fn().mockResolvedValue(undefined);
-  public messageFlagsRemoveMock = vi.fn().mockResolvedValue(undefined);
+  public messageFlagsAddMock = vi.fn().mockResolvedValue(true);
+  public messageFlagsRemoveMock = vi.fn().mockResolvedValue(true);
   public messageDeleteMock = vi.fn().mockResolvedValue(undefined);
-  public messageMoveMock = vi.fn().mockResolvedValue(undefined);
+  public messageMoveMock = vi.fn().mockResolvedValue({ path: 'INBOX', destination: 'Archive', uidMap: new Map([[123, 456]]) });
+  public mailboxCreateMock = vi.fn().mockResolvedValue({ path: 'NewFolder', created: true });
   public statusMock = vi.fn().mockResolvedValue({ messages: 10 });
   public usable = true;
   public onMock = vi.fn();
@@ -33,6 +34,7 @@ class MockImapFlow {
   messageFlagsRemove(uid: any, flags: any, opts: any) { return this.messageFlagsRemoveMock(uid, flags, opts); }
   messageDelete(uid: any, opts: any) { return this.messageDeleteMock(uid, opts); }
   messageMove(uid: any, target: any, opts: any) { return this.messageMoveMock(uid, target, opts); }
+  mailboxCreate(path: any) { return this.mailboxCreateMock(path); }
   status(name: string, opts: any) { return this.statusMock(name, opts); }
   on(event: string, handler: any) { return this.onMock(event, handler); }
 }
@@ -59,6 +61,7 @@ vi.mock('imapflow', () => {
         this.messageFlagsRemove = mockInstance.messageFlagsRemove.bind(mockInstance);
         this.messageDelete = mockInstance.messageDelete.bind(mockInstance);
         this.messageMove = mockInstance.messageMove.bind(mockInstance);
+        this.mailboxCreate = mockInstance.mailboxCreate.bind(mockInstance);
         this.status = mockInstance.status.bind(mockInstance);
         this.on = mockInstance.on.bind(mockInstance);
       }
@@ -117,6 +120,14 @@ describe('ImapService', () => {
       expect(mockInstance.onMock).toHaveBeenCalledWith('error', expect.any(Function));
       expect(mockInstance.onMock).toHaveBeenCalledWith('close', expect.any(Function));
     });
+
+    it('should not append IMAP enable hint for unrelated Gmail auth failures', async () => {
+      mockAccount.host = 'imap.gmail.com';
+      mockInstance.connectMock.mockRejectedValue(new Error('Authentication failed'));
+
+      await expect(imapService.connect(mockAccount)).rejects.toThrow('Authentication failed');
+      await expect(imapService.connect(mockAccount)).rejects.not.toThrow(/Enable IMAP|Forwarding and POP\/IMAP/);
+    });
   });
 
   describe('disconnect', () => {
@@ -169,6 +180,18 @@ describe('ImapService', () => {
 
       expect(result.success).toBe(false);
       expect(result.error).toBe('Connection refused');
+    });
+
+    it('should append provider-specific hint for explicit IMAP-disabled errors', async () => {
+      mockAccount.host = 'imap.gmx.net';
+      mockInstance.connectMock.mockRejectedValue(new Error('[ALERT] IMAP access disabled'));
+
+      const result = await imapService.testConnection(mockAccount);
+
+      expect(result.success).toBe(false);
+      expect(result.error).toContain('[ALERT] IMAP access disabled');
+      expect(result.error).toContain('Hint: GMX requires IMAP access to be manually enabled.');
+      expect(result.error).toContain('Settings → Email → POP3 & IMAP → Enable IMAP access');
     });
   });
 
@@ -273,6 +296,186 @@ describe('ImapService', () => {
         { uid: true }
       );
     });
+
+    it('should build a full bracketed HEADER message-id search clause (Apple needs brackets)', async () => {
+      // default searchMock returns [] → searchEmails returns before fetch
+      await imapService.connect(mockAccount);
+      // input without brackets must be wrapped; case preserved
+      await imapService.searchEmails(mockAccount.id, 'INBOX', { messageId: 'ABC@Host' });
+
+      expect(mockInstance.searchMock).toHaveBeenCalledWith(
+        expect.objectContaining({ header: { 'message-id': '<ABC@Host>' } }),
+        expect.any(Object)
+      );
+    });
+
+    it('should search with a single custom keyword', async () => {
+      await imapService.connect(mockAccount);
+      await imapService.searchEmails(mockAccount.id, 'INBOX', { keywords: ['Important'] });
+
+      expect(mockInstance.searchMock).toHaveBeenCalledWith(
+        expect.objectContaining({ keyword: 'Important' }),
+        expect.any(Object)
+      );
+    });
+
+    it('should OR multiple custom keywords', async () => {
+      await imapService.connect(mockAccount);
+      await imapService.searchEmails(mockAccount.id, 'INBOX', { keywords: ['Important', 'ToRead'] });
+
+      expect(mockInstance.searchMock).toHaveBeenCalledWith(
+        expect.objectContaining({
+          or: [{ keyword: 'Important' }, { keyword: 'ToRead' }],
+        }),
+        expect.any(Object)
+      );
+    });
+
+    it('should exclude a single custom keyword via unKeyword', async () => {
+      await imapService.connect(mockAccount);
+      await imapService.searchEmails(mockAccount.id, 'INBOX', { unKeywords: ['Archived'] });
+
+      expect(mockInstance.searchMock).toHaveBeenCalledWith(
+        expect.objectContaining({ unKeyword: 'Archived' }),
+        expect.any(Object)
+      );
+    });
+
+    it('should AND-exclude multiple custom keywords via NOT(OR(...))', async () => {
+      await imapService.connect(mockAccount);
+      await imapService.searchEmails(mockAccount.id, 'INBOX', { unKeywords: ['Archived', 'Spammy'] });
+
+      expect(mockInstance.searchMock).toHaveBeenCalledWith(
+        expect.objectContaining({
+          not: { or: [{ keyword: 'Archived' }, { keyword: 'Spammy' }] },
+        }),
+        expect.any(Object)
+      );
+    });
+
+    it('should combine keywords with an existing criterion', async () => {
+      await imapService.connect(mockAccount);
+      await imapService.searchEmails(mockAccount.id, 'INBOX', { seen: false, keywords: ['Important'] });
+
+      expect(mockInstance.searchMock).toHaveBeenCalledWith(
+        expect.objectContaining({ seen: false, keyword: 'Important' }),
+        expect.any(Object)
+      );
+    });
+
+    it('should reject a system flag passed as a custom keyword', async () => {
+      await imapService.connect(mockAccount);
+      await expect(
+        imapService.searchEmails(mockAccount.id, 'INBOX', { keywords: ['\\Seen'] })
+      ).rejects.toThrow(/system flag/);
+    });
+  });
+
+  describe('findEmailByMessageId', () => {
+    it('finds a message in Archive and early-exits before later folders', async () => {
+      mockInstance.listMock.mockResolvedValue([
+        { path: 'INBOX', delimiter: '/', flags: [] },
+        { path: 'Archive', delimiter: '/', flags: ['\\Archive'] },
+        { path: 'Junk', delimiter: '/', flags: ['\\Junk'] },
+      ]);
+
+      let currentFolder = '';
+      mockInstance.getMailboxLockMock.mockImplementation((name: string) => {
+        currentFolder = name;
+        return Promise.resolve({ release: vi.fn() });
+      });
+      mockInstance.searchMock.mockImplementation(() =>
+        Promise.resolve(currentFolder === 'Archive' ? [42] : [])
+      );
+      mockInstance.fetchMock.mockImplementation(() => ({
+        [Symbol.asyncIterator]: () => {
+          let yielded = false;
+          return {
+            next: () => {
+              if (currentFolder !== 'Archive' || yielded) return Promise.resolve({ done: true });
+              yielded = true;
+              return Promise.resolve({
+                value: {
+                  uid: 42,
+                  internalDate: new Date('2026-01-01T00:00:00Z'),
+                  envelope: {
+                    subject: 'Archived mail',
+                    messageId: '<found@host>',
+                    from: [{ name: 'A', address: 'a@host' }],
+                    to: [],
+                  },
+                  flags: new Set<string>(['\\Seen']),
+                },
+                done: false,
+              });
+            },
+          };
+        },
+      }));
+
+      await imapService.connect(mockAccount);
+      const res = await imapService.findEmailByMessageId(mockAccount.id, '<found@host>');
+
+      expect(res.found).toBe(true);
+      expect(res.folder).toBe('Archive');
+      expect(res.uid).toBe(42);
+      expect(res.foldersSearched).toEqual(['INBOX', 'Archive']); // Junk never opened
+    });
+
+    it('rejects a substring false-positive Message-ID (exact verify)', async () => {
+      mockInstance.listMock.mockResolvedValue([
+        { path: 'INBOX', delimiter: '/', flags: [] },
+      ]);
+      mockInstance.searchMock.mockResolvedValue([7]);
+      mockInstance.fetchMock.mockReturnValue({
+        [Symbol.asyncIterator]: () => {
+          let done = false;
+          return {
+            next: () => {
+              if (done) return Promise.resolve({ done: true });
+              done = true;
+              return Promise.resolve({
+                value: {
+                  uid: 7,
+                  internalDate: new Date(),
+                  envelope: {
+                    subject: 'Not it',
+                    messageId: '<prefix-abc@host>', // contains 'abc@host' but != target
+                    from: [{ address: 'x@host' }],
+                    to: [],
+                  },
+                  flags: new Set<string>(),
+                },
+                done: false,
+              });
+            },
+          };
+        },
+      });
+
+      await imapService.connect(mockAccount);
+      const res = await imapService.findEmailByMessageId(mockAccount.id, '<abc@host>');
+
+      expect(res.found).toBe(false);
+    });
+
+    it('uses the Gmail \\All mailbox as the sole primary search target', async () => {
+      // real ImapFlow returns `flags` as a Set, not an array (regression guard)
+      mockInstance.listMock.mockResolvedValue([
+        { path: 'INBOX', delimiter: '/', flags: new Set(['\\HasNoChildren']) },
+        { path: '[Gmail]/All Mail', delimiter: '/', flags: new Set(['\\All']) },
+        { path: '[Gmail]/Trash', delimiter: '/', flags: new Set(['\\Trash']) },
+        { path: '[Gmail]/Sent Mail', delimiter: '/', flags: new Set(['\\Sent']) },
+      ]);
+      mockInstance.searchMock.mockResolvedValue([]); // no hit anywhere
+
+      await imapService.connect(mockAccount);
+      const res = await imapService.findEmailByMessageId(mockAccount.id, '<x@host>');
+
+      expect(res.found).toBe(false);
+      // \All fast path: only All Mail + Trash searched, NOT INBOX or Sent
+      expect(res.foldersSearched).toEqual(['[Gmail]/All Mail', '[Gmail]/Trash']);
+    });
   });
 
   describe('getLatestEmails', () => {
@@ -322,6 +525,41 @@ describe('ImapService', () => {
       expect(result[0].uid).toBe(4);
       expect(result[1].uid).toBe(3);
     });
+
+    it('derives customKeywords from flags, excluding system flags', async () => {
+      mockInstance.searchMock.mockResolvedValue([1]);
+      mockInstance.fetchMock.mockReturnValue({
+        [Symbol.asyncIterator]: () => {
+          let done = false;
+          return {
+            next: () => {
+              if (done) return Promise.resolve({ done: true });
+              done = true;
+              return Promise.resolve({
+                value: {
+                  uid: 1,
+                  internalDate: new Date('2025-01-01'),
+                  envelope: {
+                    from: [{ address: 'a@host' }],
+                    to: [],
+                    subject: 'Mixed flags',
+                    messageId: '<mixed@host>',
+                  },
+                  flags: new Set<string>(['\\Seen', '\\Flagged', '$cl_3']),
+                },
+                done: false,
+              });
+            },
+          };
+        },
+      });
+
+      await imapService.connect(mockAccount);
+      const result = await imapService.getLatestEmails(mockAccount.id, 'INBOX', 1);
+
+      expect(result[0].flags).toEqual(expect.arrayContaining(['\\Seen', '\\Flagged', '$cl_3']));
+      expect(result[0].customKeywords).toEqual(['$cl_3']);
+    });
   });
 
   describe('error handling', () => {
@@ -358,6 +596,94 @@ describe('ImapService', () => {
     });
   });
 
+  describe('flagEmail', () => {
+    it('should add Flagged flag', async () => {
+      await imapService.connect(mockAccount);
+      await imapService.flagEmail(mockAccount.id, 'INBOX', 123);
+
+      expect(mockInstance.messageFlagsAddMock).toHaveBeenCalledWith(
+        123,
+        ['\\Flagged'],
+        { uid: true }
+      );
+    });
+  });
+
+  describe('unflagEmail', () => {
+    it('should remove Flagged flag', async () => {
+      await imapService.connect(mockAccount);
+      await imapService.unflagEmail(mockAccount.id, 'INBOX', 123);
+
+      expect(mockInstance.messageFlagsRemoveMock).toHaveBeenCalledWith(
+        123,
+        ['\\Flagged'],
+        { uid: true }
+      );
+    });
+  });
+
+  describe('addKeyword', () => {
+    it('should add the given keyword verbatim', async () => {
+      await imapService.connect(mockAccount);
+      await imapService.addKeyword(mockAccount.id, 'INBOX', 123, '$cl_3');
+
+      expect(mockInstance.messageFlagsAddMock).toHaveBeenCalledWith(
+        123,
+        ['$cl_3'],
+        { uid: true }
+      );
+    });
+
+    it('should throw when the server rejects or ignores the keyword change', async () => {
+      mockInstance.messageFlagsAddMock.mockResolvedValueOnce(false);
+      await imapService.connect(mockAccount);
+
+      await expect(
+        imapService.addKeyword(mockAccount.id, 'INBOX', 123, '$cl_3')
+      ).rejects.toThrow('Server did not apply keyword "$cl_3"');
+    });
+
+    it('should reject a system flag instead of applying it', async () => {
+      await imapService.connect(mockAccount);
+
+      await expect(
+        imapService.addKeyword(mockAccount.id, 'INBOX', 123, '\\Deleted')
+      ).rejects.toThrow('"\\Deleted" is a system flag, not a custom keyword');
+      expect(mockInstance.messageFlagsAddMock).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('removeKeyword', () => {
+    it('should remove the given keyword verbatim', async () => {
+      await imapService.connect(mockAccount);
+      await imapService.removeKeyword(mockAccount.id, 'INBOX', 123, '$cl_3');
+
+      expect(mockInstance.messageFlagsRemoveMock).toHaveBeenCalledWith(
+        123,
+        ['$cl_3'],
+        { uid: true }
+      );
+    });
+
+    it('should throw when the server rejects or ignores the keyword change', async () => {
+      mockInstance.messageFlagsRemoveMock.mockResolvedValueOnce(false);
+      await imapService.connect(mockAccount);
+
+      await expect(
+        imapService.removeKeyword(mockAccount.id, 'INBOX', 123, '$cl_3')
+      ).rejects.toThrow('Server did not remove keyword "$cl_3"');
+    });
+
+    it('should reject a system flag instead of removing it', async () => {
+      await imapService.connect(mockAccount);
+
+      await expect(
+        imapService.removeKeyword(mockAccount.id, 'INBOX', 123, '\\Seen')
+      ).rejects.toThrow('"\\Seen" is a system flag, not a custom keyword');
+      expect(mockInstance.messageFlagsRemoveMock).not.toHaveBeenCalled();
+    });
+  });
+
   describe('deleteEmail', () => {
     it('should move email to Trash when not in Trash', async () => {
       await imapService.connect(mockAccount);
@@ -382,15 +708,222 @@ describe('ImapService', () => {
   });
 
   describe('moveEmail', () => {
-    it('should move email to target folder', async () => {
+    it('should move email to target folder and return result', async () => {
       await imapService.connect(mockAccount);
-      await imapService.moveEmail(mockAccount.id, 'INBOX', 123, 'Archive');
+      const result = await imapService.moveEmail(mockAccount.id, 'INBOX', 123, 'Archive');
 
       expect(mockInstance.messageMoveMock).toHaveBeenCalledWith(
         123,
         'Archive',
         { uid: true }
       );
+      expect(result).toEqual({
+        path: 'INBOX',
+        destination: 'Archive',
+        uidMap: new Map([[123, 456]]),
+      });
+    });
+
+    it('should throw when messageMove returns false', async () => {
+      mockInstance.messageMoveMock.mockResolvedValueOnce(false);
+      await imapService.connect(mockAccount);
+
+      await expect(
+        imapService.moveEmail(mockAccount.id, 'INBOX', 123, 'Archive')
+      ).rejects.toThrow('Failed to move email UID 123 from INBOX to Archive');
+    });
+
+    it('should throw when messageMove returns undefined', async () => {
+      mockInstance.messageMoveMock.mockResolvedValueOnce(undefined);
+      await imapService.connect(mockAccount);
+
+      await expect(
+        imapService.moveEmail(mockAccount.id, 'INBOX', 123, 'Archive')
+      ).rejects.toThrow('Failed to move email UID 123 from INBOX to Archive');
+    });
+
+    it('should release lock even when messageMove fails', async () => {
+      const releaseMock = vi.fn();
+      mockInstance.getMailboxLockMock.mockResolvedValueOnce({ release: releaseMock });
+      mockInstance.messageMoveMock.mockResolvedValueOnce(false);
+      await imapService.connect(mockAccount);
+
+      await expect(
+        imapService.moveEmail(mockAccount.id, 'INBOX', 123, 'Archive')
+      ).rejects.toThrow();
+
+      expect(releaseMock).toHaveBeenCalled();
+    });
+
+    it('should release lock when messageMove throws an exception', async () => {
+      const releaseMock = vi.fn();
+      mockInstance.getMailboxLockMock.mockResolvedValueOnce({ release: releaseMock });
+      mockInstance.messageMoveMock.mockRejectedValueOnce(new Error('Connection lost'));
+      await imapService.connect(mockAccount);
+
+      await expect(
+        imapService.moveEmail(mockAccount.id, 'INBOX', 123, 'Archive')
+      ).rejects.toThrow('Connection lost');
+
+      expect(releaseMock).toHaveBeenCalled();
+    });
+
+    it('should handle success without uidMap', async () => {
+      mockInstance.messageMoveMock.mockResolvedValueOnce({
+        path: 'INBOX',
+        destination: 'Taxes',
+      });
+      await imapService.connect(mockAccount);
+      const result = await imapService.moveEmail(mockAccount.id, 'INBOX', 123, 'Taxes');
+
+      expect(result.path).toBe('INBOX');
+      expect(result.destination).toBe('Taxes');
+      expect(result.uidMap).toBeUndefined();
+    });
+
+    it('should auto-create destination when missing if requested', async () => {
+      mockInstance.listMock.mockResolvedValue([{ path: 'INBOX', delimiter: '/', flags: [] }]);
+      mockInstance.mailboxCreateMock.mockResolvedValueOnce({ path: 'Archive/2026', created: true });
+      await imapService.connect(mockAccount);
+
+      const result = await imapService.moveEmail(
+        mockAccount.id, 'INBOX', 123, 'Archive/2026',
+        { createDestinationIfMissing: true },
+      );
+
+      expect(mockInstance.mailboxCreateMock).toHaveBeenCalledWith('Archive/2026');
+      expect(result.destinationCreated).toBe(true);
+      expect(mockInstance.messageMoveMock).toHaveBeenCalled();
+    });
+
+    it('should not create destination when it already exists', async () => {
+      mockInstance.listMock.mockResolvedValue([
+        { path: 'INBOX', delimiter: '/', flags: [] },
+        { path: 'Archive', delimiter: '/', flags: [] },
+      ]);
+      await imapService.connect(mockAccount);
+
+      const result = await imapService.moveEmail(
+        mockAccount.id, 'INBOX', 123, 'Archive',
+        { createDestinationIfMissing: true },
+      );
+
+      expect(mockInstance.mailboxCreateMock).not.toHaveBeenCalled();
+      expect(result.destinationCreated).toBeUndefined();
+    });
+  });
+
+  describe('createFolder', () => {
+    it('should create a new folder and return success', async () => {
+      mockInstance.mailboxCreateMock.mockResolvedValueOnce({ path: 'Archive', created: true });
+      await imapService.connect(mockAccount);
+
+      const result = await imapService.createFolder(mockAccount.id, 'Archive');
+
+      expect(mockInstance.mailboxCreateMock).toHaveBeenCalledWith('Archive');
+      expect(result).toEqual({ path: 'Archive', created: true, alreadyExisted: false });
+    });
+
+    it('should mark already-existing folders as alreadyExisted', async () => {
+      mockInstance.mailboxCreateMock.mockResolvedValueOnce({ path: 'INBOX', created: false });
+      await imapService.connect(mockAccount);
+
+      const result = await imapService.createFolder(mockAccount.id, 'INBOX');
+
+      expect(result).toEqual({ path: 'INBOX', created: false, alreadyExisted: true });
+    });
+
+    it('should treat "already exists" errors as alreadyExisted, not failures', async () => {
+      mockInstance.mailboxCreateMock.mockRejectedValueOnce(new Error('Mailbox already exists'));
+      await imapService.connect(mockAccount);
+
+      const result = await imapService.createFolder(mockAccount.id, 'INBOX');
+
+      expect(result).toEqual({ path: 'INBOX', created: false, alreadyExisted: true });
+    });
+
+    it('should rethrow with context on real failures', async () => {
+      mockInstance.mailboxCreateMock.mockRejectedValueOnce(new Error('Permission denied'));
+      await imapService.connect(mockAccount);
+
+      await expect(
+        imapService.createFolder(mockAccount.id, 'Forbidden'),
+      ).rejects.toThrow('Failed to create folder "Forbidden": Permission denied');
+    });
+  });
+
+  describe('findThreadMessages', () => {
+    it('should collect Message-IDs from source and search for replies in target', async () => {
+      mockInstance.searchMock
+        .mockResolvedValueOnce([10, 11])
+        .mockResolvedValueOnce([100])
+        .mockResolvedValueOnce([])
+        .mockResolvedValueOnce([101, 102])
+        .mockResolvedValueOnce([102]);
+
+      mockInstance.fetchMock.mockImplementation(async function* () {
+        yield { uid: 10, envelope: { messageId: '<a@x>' } };
+        yield { uid: 11, envelope: { messageId: '<b@x>' } };
+      });
+
+      await imapService.connect(mockAccount);
+      const result = await imapService.findThreadMessages(
+        mockAccount.id, 'Review', 'INBOX',
+      );
+
+      expect(result.messageIds).toEqual(['<a@x>', '<b@x>']);
+      expect(result.uids).toEqual([100, 101, 102]);
+    });
+
+    it('should skip References search when disabled', async () => {
+      mockInstance.searchMock
+        .mockResolvedValueOnce([1])
+        .mockResolvedValueOnce([200]);
+
+      mockInstance.fetchMock.mockImplementation(async function* () {
+        yield { uid: 1, envelope: { messageId: '<x@y>' } };
+      });
+
+      await imapService.connect(mockAccount);
+      const result = await imapService.findThreadMessages(
+        mockAccount.id, 'Review', 'INBOX', { searchReferences: false },
+      );
+
+      expect(mockInstance.searchMock).toHaveBeenCalledTimes(2);
+      expect(result.uids).toEqual([200]);
+    });
+
+    it('should return empty result when source folder is empty', async () => {
+      mockInstance.searchMock.mockResolvedValueOnce([]);
+
+      await imapService.connect(mockAccount);
+      const result = await imapService.findThreadMessages(
+        mockAccount.id, 'EmptyFolder', 'INBOX',
+      );
+
+      expect(result.messageIds).toEqual([]);
+      expect(result.uids).toEqual([]);
+    });
+
+    it('should tolerate per-message search errors', async () => {
+      mockInstance.searchMock
+        .mockResolvedValueOnce([1, 2])
+        .mockRejectedValueOnce(new Error('boom'))
+        .mockResolvedValueOnce([300])
+        .mockResolvedValueOnce([301])
+        .mockResolvedValueOnce([]);
+
+      mockInstance.fetchMock.mockImplementation(async function* () {
+        yield { uid: 1, envelope: { messageId: '<a@x>' } };
+        yield { uid: 2, envelope: { messageId: '<b@x>' } };
+      });
+
+      await imapService.connect(mockAccount);
+      const result = await imapService.findThreadMessages(
+        mockAccount.id, 'Review', 'INBOX',
+      );
+
+      expect(result.uids).toEqual([300, 301]);
     });
   });
 
@@ -481,7 +1014,7 @@ describe('ImapService', () => {
       expect(result.headers).toEqual({});
     });
 
-    it('should preserve existing fields unchanged', async () => {
+    it('preserves envelope fields and returns Markdown by default (raw HTML omitted)', async () => {
       mockInstance.fetchOneMock.mockResolvedValue({
         source: Buffer.from('fake raw email'),
         flags: new Set(['\\Seen']),
@@ -504,9 +1037,40 @@ describe('ImapService', () => {
 
       expect(result.from).toBe('sender@test.com');
       expect(result.subject).toBe('Backward compat');
+      expect(result.uid).toBe(5);
+      // Default bodyFormat is 'markdown': the short text/plain part is below threshold, so the
+      // body is converted from HTML; raw htmlContent must NOT cross the boundary.
+      expect(result.bodyFormat).toBe('markdown');
+      expect(result.textContent).toBe('Plain text');
+      expect(result.markdownContent).toBe('**HTML**');
+      expect(result.htmlContent).toBeUndefined();
+    });
+
+    it('returns raw htmlContent only when bodyFormat is "html"', async () => {
+      mockInstance.fetchOneMock.mockResolvedValue({
+        source: Buffer.from('fake raw email'),
+        flags: new Set(['\\Seen']),
+      });
+
+      mockedSimpleParser.mockResolvedValue({
+        date: new Date('2025-06-01'),
+        from: { text: 'sender@test.com' },
+        to: [{ text: 'recipient@test.com' }],
+        subject: 'Legacy HTML',
+        messageId: '<legacy@test.com>',
+        text: 'Plain text',
+        html: '<b>HTML</b>',
+        headers: new Map(),
+        attachments: [],
+      } as any);
+
+      await imapService.connect(mockAccount);
+      const result = await imapService.getEmailContent(mockAccount.id, 'INBOX', 6, { bodyFormat: 'html' });
+
+      expect(result.bodyFormat).toBe('html');
       expect(result.textContent).toBe('Plain text');
       expect(result.htmlContent).toBe('<b>HTML</b>');
-      expect(result.uid).toBe(5);
+      expect(result.markdownContent).toBeUndefined();
     });
   });
 
@@ -589,6 +1153,92 @@ describe('ImapService', () => {
       expect(result.content).toBe(attachmentBuffer);
       expect(result.contentType).toBe('image/png');
       expect(result.filename).toBe('image.png');
+    });
+
+    // #168: attachment names arrive in NFD from macOS senders but come back
+    // from an LLM (or any text round-trip) in NFC. Both spellings render the
+    // same and must resolve to the same attachment.
+    it('should match an NFD-encoded filename when asked for the NFC spelling', async () => {
+      const attachmentBuffer = Buffer.from('umlaut content');
+      const nfdName = '\u00dcbersicht.pdf'.normalize('NFD');
+      const nfcName = '\u00dcbersicht.pdf'.normalize('NFC');
+      expect(nfdName).not.toBe(nfcName);
+
+      mockInstance.fetchOneMock.mockResolvedValue({
+        source: Buffer.from('fake raw email source'),
+      });
+      mockedSimpleParser.mockResolvedValue({
+        attachments: [
+          { filename: nfdName, content: attachmentBuffer, contentType: 'application/pdf', contentId: undefined },
+        ],
+      } as any);
+
+      await imapService.connect(mockAccount);
+      const result = await imapService.getAttachmentContent(mockAccount.id, 'INBOX', 42, nfcName);
+
+      expect(result.content).toBe(attachmentBuffer);
+      expect(result.filename).toBe(nfdName);
+    });
+
+    it('should match an NFC-encoded filename when asked for the NFD spelling', async () => {
+      const attachmentBuffer = Buffer.from('umlaut content');
+      const nfdName = '\u00dcbersicht.pdf'.normalize('NFD');
+      const nfcName = '\u00dcbersicht.pdf'.normalize('NFC');
+
+      mockInstance.fetchOneMock.mockResolvedValue({
+        source: Buffer.from('fake raw email source'),
+      });
+      mockedSimpleParser.mockResolvedValue({
+        attachments: [
+          { filename: nfcName, content: attachmentBuffer, contentType: 'application/pdf', contentId: undefined },
+        ],
+      } as any);
+
+      await imapService.connect(mockAccount);
+      const result = await imapService.getAttachmentContent(mockAccount.id, 'INBOX', 42, nfdName);
+
+      expect(result.content).toBe(attachmentBuffer);
+    });
+
+    it('should match a contentId given without the angle brackets mailparser reports', async () => {
+      const attachmentBuffer = Buffer.from('inline image data');
+
+      mockInstance.fetchOneMock.mockResolvedValue({
+        source: Buffer.from('fake raw email source'),
+      });
+      mockedSimpleParser.mockResolvedValue({
+        attachments: [
+          { filename: 'image.png', content: attachmentBuffer, contentType: 'image/png', contentId: '<abc123@mail>' },
+        ],
+      } as any);
+
+      await imapService.connect(mockAccount);
+      const result = await imapService.getAttachmentContent(mockAccount.id, 'INBOX', 99, 'abc123@mail');
+
+      expect(result.content).toBe(attachmentBuffer);
+      expect(result.filename).toBe('image.png');
+    });
+
+    it('should prefer an exact match over a normalized one', async () => {
+      const exact = Buffer.from('exact');
+      const other = Buffer.from('other');
+      const nfdName = '\u00dcbersicht.pdf'.normalize('NFD');
+      const nfcName = '\u00dcbersicht.pdf'.normalize('NFC');
+
+      mockInstance.fetchOneMock.mockResolvedValue({
+        source: Buffer.from('fake raw email source'),
+      });
+      mockedSimpleParser.mockResolvedValue({
+        attachments: [
+          { filename: nfdName, content: other, contentType: 'application/pdf', contentId: undefined },
+          { filename: nfcName, content: exact, contentType: 'application/pdf', contentId: undefined },
+        ],
+      } as any);
+
+      await imapService.connect(mockAccount);
+      const result = await imapService.getAttachmentContent(mockAccount.id, 'INBOX', 42, nfcName);
+
+      expect(result.content).toBe(exact);
     });
 
     it('should throw error when email not found', async () => {
