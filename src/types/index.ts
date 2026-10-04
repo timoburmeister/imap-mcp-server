@@ -98,8 +98,6 @@ export interface Folder {
 export interface SearchCriteria {
   from?: string;
   to?: string;
-  cc?: string;
-  bcc?: string;
   subject?: string;
   body?: string;
   since?: Date;

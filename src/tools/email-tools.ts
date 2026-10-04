@@ -274,8 +274,6 @@ export function emailTools(
       includeDrafts: z.boolean().default(false).describe('When searchAllFolders is true, also search the Drafts folder (off by default).'),
       from: z.string().optional().describe('Search by sender'),
       to: z.string().optional().describe('Search by recipient'),
-      cc: z.string().optional().describe('Search by CC recipient'),
-      bcc: z.string().optional().describe('Search by BCC recipient'),
       subject: z.string().optional().describe('Search by subject'),
       body: z.string().optional().describe('Search in body text'),
       since: z.string().optional().describe('Search emails since date (YYYY-MM-DD)'),
@@ -296,8 +294,6 @@ export function emailTools(
 
     if (searchCriteria.from) criteria.from = searchCriteria.from;
     if (searchCriteria.to) criteria.to = searchCriteria.to;
-    if (searchCriteria.cc) criteria.cc = searchCriteria.cc;
-    if (searchCriteria.bcc) criteria.bcc = searchCriteria.bcc;
     if (searchCriteria.subject) criteria.subject = searchCriteria.subject;
     if (searchCriteria.body) criteria.body = searchCriteria.body;
     if (searchCriteria.since) criteria.since = parseDateOnly(searchCriteria.since);
@@ -758,97 +754,6 @@ export function emailTools(
         text: JSON.stringify({
           success: true,
           message: `Keyword "${keyword}" removed from email ${uid}`,
-        }, null, 2)
-      }]
-    };
-  });
-
-  // Flag email tool
-  server.registerTool('imap_flag_email', {
-    description: 'Flag an email (sets \\Flagged — shows as ⭐ in Apple Mail)',
-    inputSchema: {
-      accountId: z.string().describe('Account ID'),
-      folder: z.string().default('INBOX').describe('Folder name'),
-      uid: z.coerce.number().describe('Email UID'),
-    }
-  }, async ({ accountId, folder, uid }) => {
-    await imapService.markAsFlagged(accountId, folder, uid);
-
-    return {
-      content: [{
-        type: 'text',
-        text: JSON.stringify({
-          success: true,
-          message: `Email ${uid} flagged (⭐)`,
-        }, null, 2)
-      }]
-    };
-  });
-
-  // Unflag email tool
-  server.registerTool('imap_unflag_email', {
-    description: 'Remove flag from an email (removes \\Flagged / ⭐ in Apple Mail)',
-    inputSchema: {
-      accountId: z.string().describe('Account ID'),
-      folder: z.string().default('INBOX').describe('Folder name'),
-      uid: z.coerce.number().describe('Email UID'),
-    }
-  }, async ({ accountId, folder, uid }) => {
-    await imapService.markAsUnflagged(accountId, folder, uid);
-
-    return {
-      content: [{
-        type: 'text',
-        text: JSON.stringify({
-          success: true,
-          message: `Email ${uid} unflagged`,
-        }, null, 2)
-      }]
-    };
-  });
-
-  // Save draft tool
-  server.registerTool('imap_save_draft', {
-    description: 'Save an email as draft in the Drafts folder (visible immediately in Apple Mail)',
-    inputSchema: {
-      accountId: z.string().describe('Account ID'),
-      from: z.string().describe('Sender email address'),
-      to: z.union([z.string(), z.array(z.string())]).describe('Recipient(s)'),
-      subject: z.string().describe('Email subject'),
-      text: z.string().optional().describe('Plain text body'),
-      html: z.string().optional().describe('HTML body'),
-      cc: z.union([z.string(), z.array(z.string())]).optional().describe('CC recipient(s)'),
-      bcc: z.union([z.string(), z.array(z.string())]).optional().describe('BCC recipient(s)'),
-    }
-  }, async ({ accountId, ...draft }) => {
-    const result = await imapService.saveDraft(accountId, draft);
-
-    return {
-      content: [{
-        type: 'text',
-        text: JSON.stringify(result, null, 2)
-      }]
-    };
-  });
-
-  // Set Apple Mail color flag tool
-  server.registerTool('imap_set_flag_color', {
-    description: 'Set a colored flag (⭐) on an email — appears as colored star in Apple Mail. Colors: red, orange, yellow, green, blue, purple. Pass null to remove color.',
-    inputSchema: {
-      accountId: z.string().describe('Account ID'),
-      folder: z.string().default('INBOX').describe('Folder name'),
-      uid: z.coerce.number().describe('Email UID'),
-      color: z.enum(['red', 'orange', 'yellow', 'green', 'blue', 'purple']).nullable().describe('Flag color, or null to remove'),
-    }
-  }, async ({ accountId, folder, uid, color }) => {
-    await imapService.setFlagColor(accountId, folder, uid, color);
-
-    return {
-      content: [{
-        type: 'text',
-        text: JSON.stringify({
-          success: true,
-          message: color ? `Email ${uid} flagged ${color}` : `Color flag removed from email ${uid}`,
         }, null, 2)
       }]
     };
